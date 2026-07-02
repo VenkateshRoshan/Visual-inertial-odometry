@@ -1,0 +1,42 @@
+# ==========================================================================
+# Python dependencies for the drone VIO project
+# (collect_vio_dataset.py, DataLoader.py, Train.py, Test.py)
+# ==========================================================================
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# NOTE on PyTorch and CUDA:
+#   The lines below install the default CPU or bundled CUDA build. If you
+#   want a specific CUDA version, install torch and torchvision from
+#   https://pytorch.org/get-started/locally/ first, then run this file for
+#   the rest. torchvision must match the torch version you pick.
+#
+# NOTE on numpy:
+#   numpy is pinned below 2.0 on purpose. ROS 2 cv_bridge is usually built
+#   against numpy 1.x, and installing numpy 2.x with pip can break it. If
+#   your cv_bridge is built against numpy 2.x, you may remove the ceiling.
+# --------------------------------------------------------------------------
+
+numpy>=1.24,<2.0
+torch>=2.0
+torchvision>=0.15
+Pillow>=9.0
+matplotlib>=3.6
+opencv-python>=4.6
+
+# ==========================================================================
+# Provided by your ROS 2 installation, NOT by pip. Do not install these
+# with pip. They come with the ROS 2 distribution (for example Humble or
+# Jazzy) and its vision_opencv package:
+#
+#   rclpy
+#   cv_bridge
+#   sensor_msgs
+#   geometry_msgs
+#   std_msgs
+#
+# Source your workspace before running the scripts, for example:
+#   source /opt/ros/<distro>/setup.bash
+#   source ~/Documents/Projects/VIO/ros_ws/install/setup.bash
+# ==========================================================================
