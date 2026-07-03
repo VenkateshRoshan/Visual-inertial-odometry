@@ -4,18 +4,21 @@ Test.py
 
 Live evaluation of the trained VIO model against Gazebo.
 
-It connects to the running simulation, flies the drone along a chosen path,
-feeds the live camera and IMU stream through the model, integrates the
-predicted relative poses into a full trajectory, and plots that estimated
-trajectory against the ground truth in a matplotlib window that updates while
-the drone is flying.
+Pipeline each cycle:
+  1. Fly the drone along a chosen path in the simulation.
+  2. Collect the camera frames and the IMU samples between them.
+  3. Run the model on a stack of frames + the IMU sequence.
+  4. Integrate the predicted relative pose onto the running estimate.
+  5. Plot the new predicted point joined to the previous one, so the
+     predicted path grows live on top of the actual path for comparison.
 
 Run (with the simulation already up):
     python3 Test.py --checkpoint vio_model.pt --path square
     python3 Test.py --checkpoint vio_model.pt --path circle
-    python3 Test.py --no-fly            # you drive the drone yourself
+    python3 Test.py --no-fly          # you drive the drone yourself
+    python3 Test.py --hide-gt         # draw only the predicted path
 
-The model, preprocessing and pose math are imported from Train.py and
+Model, preprocessing and pose math are imported from Train.py and
 DataLoader.py so they exactly match training.
 """
 
@@ -31,6 +34,7 @@ import torch
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import Image, Imu
 from geometry_msgs.msg import Pose, Twist
@@ -40,7 +44,7 @@ from cv_bridge import CvBridge
 
 import matplotlib.pyplot as plt
 
-from DataLoader import (
+from data_loader import (
     build_image_transform,
     bgr_to_input_tensor,
     resample_imu,
@@ -48,7 +52,7 @@ from DataLoader import (
     quat_to_matrix,
     integrate_pose,
 )
-from Train import VIONet
+from train import VIONet
 
 
 # ---------------------------------------------------------------------------
@@ -150,16 +154,26 @@ class VIOSensorNode(Node):
         self.imu_buf = deque(maxlen=20000)     # (ts, np6)
         self.latest_gt = None                  # (pos3, quat4)
 
+        # counters so we can see what is actually arriving
+        self.n_img = 0
+        self.n_imu = 0
+        self.n_gt = 0
+
+        # Gazebo sensor topics are usually published best effort. A default
+        # (reliable) subscription receives nothing from them, which shows up
+        # as an empty plot. sensor data QoS is best effort and is compatible
+        # with both reliable and best effort publishers.
         image_topic = f"/simple_drone/{camera}/image_raw"
-        self.create_subscription(Image, image_topic, self.image_cb, 10)
-        self.create_subscription(Imu, "/simple_drone/imu/out", self.imu_cb, 100)
-        self.create_subscription(Pose, "/simple_drone/gt_pose", self.pose_cb, 50)
+        self.create_subscription(Image, image_topic, self.image_cb, qos_profile_sensor_data)
+        self.create_subscription(Imu, "/simple_drone/imu/out", self.imu_cb, qos_profile_sensor_data)
+        self.create_subscription(Pose, "/simple_drone/gt_pose", self.pose_cb, qos_profile_sensor_data)
 
     def image_cb(self, msg):
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         with self.lock:
             self.frame_buf.append((ts, frame))
+            self.n_img += 1
 
     def imu_cb(self, msg):
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -169,6 +183,7 @@ class VIOSensorNode(Node):
         ], dtype=np.float32)
         with self.lock:
             self.imu_buf.append((ts, vec))
+            self.n_imu += 1
 
     def pose_cb(self, msg):
         with self.lock:
@@ -177,12 +192,17 @@ class VIOSensorNode(Node):
                 np.array([msg.orientation.x, msg.orientation.y,
                           msg.orientation.z, msg.orientation.w], dtype=np.float64),
             )
+            self.n_gt += 1
 
     def pop_frames(self):
         with self.lock:
             frames = list(self.frame_buf)
             self.frame_buf.clear()
         return frames
+
+    def frames_pending(self):
+        with self.lock:
+            return len(self.frame_buf)
 
     def imu_between(self, t0, t1):
         with self.lock:
@@ -199,44 +219,61 @@ class VIOSensorNode(Node):
 
 
 # ---------------------------------------------------------------------------
-# Live plot
+# Live plot: predicted path grows point by point over the actual path
 # ---------------------------------------------------------------------------
 
 class LivePlot:
-    def __init__(self):
+    def __init__(self, show_gt=True):
         plt.ion()
-        self.fig, (self.ax_xy, self.ax_z) = plt.subplots(1, 2, figsize=(12, 5))
+        self.show_gt = show_gt
+        self.fig, (self.ax_xy, self.ax_z) = plt.subplots(
+            1, 2, figsize=(13, 6), gridspec_kw={"width_ratios": [2, 1]}
+        )
 
-        self.gt_xy, = self.ax_xy.plot([], [], "g-", label="ground truth")
-        self.est_xy, = self.ax_xy.plot([], [], "r-", label="VIO estimate")
-        self.ax_xy.set_title("Top down trajectory")
+        # top down XY view, this is where you read off the path shape
+        if show_gt:
+            self.gt_xy, = self.ax_xy.plot([], [], color="green", ls="--", lw=1.5, label="actual path")
+        # predicted path: a line with a dot at every predicted point
+        self.est_xy, = self.ax_xy.plot([], [], color="red", marker="o", ms=4, lw=1.5, label="predicted path")
+        # the newest predicted point, so you can watch it move
+        self.cur_xy, = self.ax_xy.plot([], [], color="black", marker="*", ms=16, ls="none", label="current")
+        # where the path started
+        self.start_xy, = self.ax_xy.plot([], [], color="blue", marker="s", ms=9, ls="none", label="start")
+        self.ax_xy.set_title("Predicted path vs actual path (top down)")
         self.ax_xy.set_xlabel("x (m)")
         self.ax_xy.set_ylabel("y (m)")
         self.ax_xy.axis("equal")
         self.ax_xy.grid(True)
-        self.ax_xy.legend()
+        self.ax_xy.legend(loc="best")
 
-        self.gt_z, = self.ax_z.plot([], [], "g-", label="ground truth")
-        self.est_z, = self.ax_z.plot([], [], "r-", label="VIO estimate")
+        # altitude over steps
+        if show_gt:
+            self.gt_z, = self.ax_z.plot([], [], color="green", ls="--", lw=1.5, label="actual")
+        self.est_z, = self.ax_z.plot([], [], color="red", marker="o", ms=3, lw=1.5, label="predicted")
         self.ax_z.set_title("Altitude over steps")
         self.ax_z.set_xlabel("step")
         self.ax_z.set_ylabel("z (m)")
         self.ax_z.grid(True)
-        self.ax_z.legend()
+        self.ax_z.legend(loc="best")
 
     def update(self, gt, est, rmse):
-        gt = np.array(gt)
         est = np.array(est)
-        if len(gt):
-            self.gt_xy.set_data(gt[:, 0], gt[:, 1])
-            self.gt_z.set_data(range(len(gt)), gt[:, 2])
+        gt = np.array(gt)
+
         if len(est):
             self.est_xy.set_data(est[:, 0], est[:, 1])
+            self.cur_xy.set_data([est[-1, 0]], [est[-1, 1]])
+            self.start_xy.set_data([est[0, 0]], [est[0, 1]])
             self.est_z.set_data(range(len(est)), est[:, 2])
+        if self.show_gt and len(gt):
+            self.gt_xy.set_data(gt[:, 0], gt[:, 1])
+            self.gt_z.set_data(range(len(gt)), gt[:, 2])
+
         for ax in (self.ax_xy, self.ax_z):
             ax.relim()
             ax.autoscale_view()
-        self.fig.suptitle(f"position RMSE: {rmse:.3f} m")
+
+        self.fig.suptitle(f"steps: {len(est)}    position RMSE: {rmse:.3f} m")
         self.fig.canvas.draw_idle()
         plt.pause(0.001)
 
@@ -250,7 +287,10 @@ class LivePlot:
 # ---------------------------------------------------------------------------
 
 def load_model(checkpoint_path, device):
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False because the checkpoint also stores the config dict
+    # and the numpy IMU normalisation arrays, not just tensor weights.
+    # This is safe here since you created the checkpoint yourself.
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
     model = VIONet(cfg).to(device)
     model.load_state_dict(ckpt["model_state"])
@@ -263,6 +303,7 @@ def main():
     parser.add_argument("--checkpoint", default="vio_model.pt")
     parser.add_argument("--path", default=None, help="trajectory to fly (default: config test_path)")
     parser.add_argument("--no-fly", action="store_true", help="do not command the drone, just observe")
+    parser.add_argument("--hide-gt", action="store_true", help="plot only the predicted path")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -308,11 +349,12 @@ def main():
     flight_thread.start()
 
     # inference state
-    plot = LivePlot()
+    plot = LivePlot(show_gt=not args.hide_gt)
     window = []                 # list of (ts, bgr)
     R_est, p_est = None, None
     est_traj, gt_traj = [], []
     transform = sensors.transform
+    rmse = 0.0
 
     def preprocess_window(win):
         imgs = [bgr_to_input_tensor(bgr, transform) for _, bgr in win]
@@ -323,52 +365,62 @@ def main():
         return images, imu
 
     print("Waiting for frames...")
+    last_log = time.time()
     try:
         while rclpy.ok():
             for ts, bgr in sensors.pop_frames():
-                # initialise the estimate on the very first frame we see
+                # initialise on the first frame. Use ground truth as the start
+                # point if available, otherwise start at the origin so the
+                # predicted path still plots.
                 if R_est is None:
                     gt = sensors.get_gt()
-                    if gt is None:
-                        continue
-                    p_est = gt[0].copy()
-                    R_est = quat_to_matrix(*gt[1])
+                    if gt is not None:
+                        p_est = gt[0].copy()
+                        R_est = quat_to_matrix(*gt[1])
+                        gt_traj.append(gt[0].copy())
+                    else:
+                        p_est = np.zeros(3, dtype=np.float64)
+                        R_est = np.eye(3)
+                        gt_traj.append(p_est.copy())
                     est_traj.append(p_est.copy())
-                    gt_traj.append(gt[0].copy())
 
                 window.append((ts, bgr))
                 if len(window) == N:
                     images, imu = preprocess_window(window)
                     with torch.no_grad():
                         pred = model(images, imu).cpu().numpy()[0]
-                    R_est, p_est = integrate_pose(R_est, p_est, pred)
 
+                    # new predicted point = previous point + predicted motion
+                    R_est, p_est = integrate_pose(R_est, p_est, pred)
                     est_traj.append(p_est.copy())
+
                     gt = sensors.get_gt()
                     gt_traj.append(gt[0].copy() if gt is not None else gt_traj[-1])
 
-                    window = [window[-1]]   # share the boundary frame
+                    window = [window[-1]]   # keep the boundary frame
 
-            # running error and live plot
             m = min(len(est_traj), len(gt_traj))
-            rmse = 0.0
             if m > 1:
                 diff = np.array(est_traj[:m]) - np.array(gt_traj[:m])
                 rmse = float(np.sqrt((diff ** 2).sum(axis=1).mean()))
             plot.update(gt_traj, est_traj, rmse)
 
-            if flight_done.is_set() and not sensors.frame_buf:
+            if time.time() - last_log > 2.0:
+                print(f"received  frames={sensors.n_img}  imu={sensors.n_imu}  "
+                      f"gt={sensors.n_gt}   predicted points={len(est_traj)}")
+                last_log = time.time()
+
+            if flight_done.is_set() and sensors.frames_pending() == 0:
                 break
     except KeyboardInterrupt:
         print("Stopped.")
 
-    # final report
     m = min(len(est_traj), len(gt_traj))
     if m > 1:
         diff = np.array(est_traj[:m]) - np.array(gt_traj[:m])
         rmse = float(np.sqrt((diff ** 2).sum(axis=1).mean()))
         print(f"Final position RMSE over {m} steps: {rmse:.3f} m")
-    plot.update(gt_traj, est_traj, rmse if m > 1 else 0.0)
+    plot.update(gt_traj, est_traj, rmse)
 
     executor.shutdown()
     sensors.destroy_node()
